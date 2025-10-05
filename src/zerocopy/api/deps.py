@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
-
 from ..config import CONFIG
 from ..index.faiss_store import FaissStore
 from ..io.db import ChunkDatabase
@@ -40,21 +38,10 @@ def get_index_path() -> Path:
     return _data_root() / _INDEX_FILENAME
 
 
-def _embedding_dim_from_encoder(encoder: VideoMAEEncoder) -> int:
-    config = getattr(encoder, "model", None)
-    config = getattr(config, "config", None)
-    candidates: Iterable[str] = ("hidden_size", "embedding_dim", "d_model", "projection_dim")
-    for attr in candidates:
-        value = getattr(config, attr, None)
-        if isinstance(value, int) and value > 0:
-            return int(value)
-    raise RuntimeError("Unable to determine embedding dimension from VideoMAE encoder config")
-
-
 @lru_cache
 def get_videomae_encoder() -> VideoMAEEncoder:
     ensure_storage_directories()
-    encoder = VideoMAEEncoder()
+    encoder = VideoMAEEncoder(use_stub=not CONFIG.models.videomae_enabled)
     encoder.load()
     return encoder
 
@@ -65,8 +52,11 @@ def get_faiss_store() -> FaissStore:
     index_path = get_index_path()
     if index_path.exists():
         return FaissStore.load(index_path)
-    encoder = get_videomae_encoder()
-    dim = _embedding_dim_from_encoder(encoder)
+    if not CONFIG.models.videomae_enabled:
+        dim = VideoMAEEncoder.DEFAULT_EMBEDDING_DIM
+    else:
+        encoder = get_videomae_encoder()
+        dim = encoder.embedding_dim
     return FaissStore(dim=dim)
 
 

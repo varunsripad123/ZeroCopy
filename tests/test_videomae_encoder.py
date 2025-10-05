@@ -96,3 +96,19 @@ def test_read_video_frames_rgb_missing(tmp_path):
     missing = tmp_path / "missing.mp4"
     with pytest.raises(FileNotFoundError):
         read_video_frames_rgb(missing)
+
+
+def test_stub_encoder_is_deterministic():
+    frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(4)]
+    encoder = VideoMAEEncoder(use_stub=True)
+    encoder.load()
+
+    embedding_a = encoder.encode(frames)
+    embedding_b = encoder.encode(frames)
+    assert embedding_a.shape == (encoder.embedding_dim,)
+    np.testing.assert_allclose(embedding_a, embedding_b)
+
+    altered = frames.copy()
+    altered[0] = np.ones((2, 2, 3), dtype=np.uint8)
+    embedding_c = encoder.encode(altered)
+    assert not np.allclose(embedding_a, embedding_c)

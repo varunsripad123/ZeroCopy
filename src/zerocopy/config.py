@@ -50,6 +50,13 @@ class IndexConfig:
 
 
 @dataclass(slots=True)
+class ModelConfig:
+    """Configuration for ML models used by the service."""
+
+    videomae_enabled: bool = os.getenv("ZEROCOPY_VIDEOMAE_ENABLED", "true").lower() == "true"
+
+
+@dataclass(slots=True)
 class ApiConfig:
     host: str = os.getenv("ZEROCOPY_API_HOST", "0.0.0.0")
     port: int = int(os.getenv("ZEROCOPY_API_PORT", "8080"))
@@ -61,6 +68,7 @@ class ApiConfig:
 class ZerocopyConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     index: IndexConfig = field(default_factory=IndexConfig)
+    models: ModelConfig = field(default_factory=ModelConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
 
 
