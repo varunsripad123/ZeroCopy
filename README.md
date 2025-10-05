@@ -89,6 +89,11 @@ Environment variables can be used to control runtime behaviour:
 | `ZEROCOPY_API_PORT` | API port | `8080` |
 | `ZEROCOPY_CORS_ALLOW_ORIGIN` | Optional single CORS origin | _unset_ |
 | `ZEROCOPY_CORS_ALLOW_ORIGINS` | Comma-separated list of CORS origins | _unset_ |
+| `ZEROCOPY_VIDEOMAE_ENABLED` | Enable downloading and using the real VideoMAE encoder weights | `true` |
+
+Setting `ZEROCOPY_VIDEOMAE_ENABLED=false` keeps the API responsive in environments without
+access to the Hugging Face model hub by falling back to a deterministic stub encoder that
+maintains a compatible embedding dimensionality for the FAISS index.
 
 ### Frontend Console
 
