@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.cache/
+.coverage
+build/
+dist/
+*.log
+artifacts/
+data/chunks/
