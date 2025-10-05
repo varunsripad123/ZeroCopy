@@ -33,3 +33,4 @@ class DecodeRequest(BaseModel):
 class DecodeResponse(BaseModel):
     chunk_id: str
     chunk_path: str
+    chunk_url: str

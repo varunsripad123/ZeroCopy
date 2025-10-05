@@ -32,6 +32,8 @@ class CompressionService:
         self.chunker = chunker or VideoChunker(storage=self.manifest.config)
         self.encoder = encoder or HashEncoder()
         self.embedding_writer = embedding_writer or EmbeddingWriter(self.manifest.config)
+        self.manifest.config.root_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest.config.upload_dir.mkdir(parents=True, exist_ok=True)
         if index is not None:
             self.index = index
         else:
