@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, TYPE_CHECKING
+from typing import Any, Iterable, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
@@ -22,6 +23,63 @@ else:  # pragma: no cover - runtime placeholders when transformers is absent
     HFVideoMAEModel = Any
 
 
+def _mp4_display_dimensions(path: Path) -> Tuple[int | None, int | None]:
+    """Extract the display width/height from an MP4 container if available."""
+
+    try:
+        data = path.read_bytes()
+    except OSError:  # pragma: no cover - file access error
+        return None, None
+
+    def _iter_boxes(buffer: bytes):
+        offset = 0
+        length = len(buffer)
+        while offset + 8 <= length:
+            size = struct.unpack_from(">I", buffer, offset)[0]
+            box_type = buffer[offset + 4 : offset + 8]
+            header = 8
+            if size == 1:
+                if offset + 16 > length:
+                    return
+                size = struct.unpack_from(">Q", buffer, offset + 8)[0]
+                header = 16
+            elif size == 0:
+                size = length - offset
+            payload = buffer[offset + header : offset + size]
+            yield box_type, payload
+            offset += size
+
+    def _parse_tkhd(payload: bytes) -> Tuple[int | None, int | None]:
+        if not payload:
+            return None, None
+        version = payload[0]
+        if version == 1 and len(payload) >= 92:
+            width_offset = 88
+        elif version == 0 and len(payload) >= 80:
+            width_offset = 76
+        else:
+            return None, None
+        width_fixed = struct.unpack_from(">I", payload, width_offset)[0]
+        height_fixed = struct.unpack_from(">I", payload, width_offset + 4)[0]
+        width = int(round(width_fixed / 65536.0))
+        height = int(round(height_fixed / 65536.0))
+        return (width or None), (height or None)
+
+    def _find_dimensions(buffer: bytes) -> Tuple[int | None, int | None]:
+        for box_type, payload in _iter_boxes(buffer):
+            if box_type == b"moov":
+                for inner_type, inner_payload in _iter_boxes(payload):
+                    if inner_type == b"trak":
+                        for trak_type, trak_payload in _iter_boxes(inner_payload):
+                            if trak_type == b"tkhd":
+                                dims = _parse_tkhd(trak_payload)
+                                if dims != (None, None):
+                                    return dims
+        return None, None
+
+    return _find_dimensions(data)
+
+
 def read_video_frames_rgb(path: str | Path, num_frames: int | None = None) -> List[np.ndarray]:
     """Read frames from ``path`` as RGB numpy arrays."""
     import cv2
@@ -30,12 +88,32 @@ def read_video_frames_rgb(path: str | Path, num_frames: int | None = None) -> Li
     if not video_path.exists():
         raise FileNotFoundError(f"Video path does not exist: {video_path}")
 
+    target_width, target_height = _mp4_display_dimensions(video_path)
+
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():  # pragma: no cover - defensive guard
         capture.release()
         raise RuntimeError(f"Unable to open video: {video_path}")
 
     frames: List[np.ndarray] = []
+    width_prop = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))) or None
+    height_prop = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))) or None
+    if width_prop is not None and width_prop <= 0:
+        width_prop = None
+    if height_prop is not None and height_prop <= 0:
+        height_prop = None
+
+    expected_width = target_width or width_prop
+    expected_height = target_height or height_prop
+
+    if expected_width is None and width_prop is not None:
+        expected_width = width_prop
+    if expected_height is None and height_prop is not None:
+        expected_height = height_prop
+
+    if width_prop is not None and width_prop % 2 == 0 and width_prop < 8:
+        expected_width = width_prop + 1
+
     try:
         limit = None if num_frames is None or num_frames <= 0 else num_frames
         while True:
@@ -45,6 +123,9 @@ def read_video_frames_rgb(path: str | Path, num_frames: int | None = None) -> Li
             if not success:
                 break
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if expected_width and expected_height:
+                if frame_rgb.shape[1] != expected_width or frame_rgb.shape[0] != expected_height:
+                    frame_rgb = cv2.resize(frame_rgb, (expected_width, expected_height), interpolation=cv2.INTER_LINEAR)
             frames.append(frame_rgb)
     finally:
         capture.release()

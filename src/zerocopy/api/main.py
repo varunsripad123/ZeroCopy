@@ -1,31 +1,33 @@
-"""FastAPI application for Zero-Copy AI."""
+"""FastAPI surface for the Zero-Copy video pipeline."""
 from __future__ import annotations
 
-import json
-import shutil
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+import numpy as np
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 
 from ..config import CONFIG
+from ..index.faiss_store import FaissStore
+from ..io.chunker import Chunk, segment_video
+from ..io.db import ChunkDatabase, ChunkRecord
 from ..models import (
     CompressRequest,
     CompressionResponse,
     DecodeRequest,
     DecodeResponse,
+    QueryHit,
     QueryRequest,
     QueryResponse,
+    read_video_frames_rgb,
 )
-from ..services import CompressionService, QueryService
-from ..logging import get_logger
+from ..models.videomae_encoder import VideoMAEEncoder
+from ..search import TextEncoder
+from . import deps
 
-log = get_logger(__name__)
-
-app = FastAPI(title="Zero-Copy AI", version="0.1.0")
+app = FastAPI(title="Zero-Copy AI", version="1.0.0")
 
 cors_origins: List[str]
 if CONFIG.api.cors_allow_origins:
@@ -43,118 +45,153 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-compression_service = CompressionService()
-query_service = QueryService(manifest=compression_service.manifest, index=compression_service.index)
+
+@app.on_event("startup")
+def _startup() -> None:
+    deps.ensure_storage_directories()
 
 
-def _serialise_entries(entries) -> List[Dict[str, Any]]:
-    serialised = []
-    for entry in entries:
-        serialised.append(
-            {
-                "chunk_id": entry.chunk_id,
-                "start_ts": entry.start_ts,
-                "end_ts": entry.end_ts,
-                "chunk_path": entry.chunk_path,
-                "source_video": entry.source_video,
-                "embedding_path": entry.embedding_path,
-                "metadata": entry.metadata,
-                "chunk_url": f"/chunks/{entry.chunk_id}",
-            }
-        )
-    return serialised
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    store = deps.get_faiss_store()
+    deps.persist_faiss_store(store)
+    db = deps.get_chunk_database()
+    db.close()
+    deps.reset_dependencies()
 
 
-def _serialise_query_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    enriched = []
-    for result in results:
-        enriched.append({**result, "chunk_url": f"/chunks/{result['chunk_id']}"})
-    return enriched
+def _validate_source(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail=f"Video not found: {resolved}")
+    return resolved
+
+
+def _build_chunk_id(video_id: str, chunk: Chunk) -> str:
+    return f"{video_id}_{chunk.chunk_id}"
+
+
+def _build_chunk_meta(chunk: Chunk, metadata: dict | None) -> dict:
+    meta = {
+        "segment": {
+            "frames": chunk.frames,
+            "sha256": chunk.sha256,
+        }
+    }
+    if metadata:
+        meta["user"] = metadata
+    return meta
 
 
 @app.post("/compress", response_model=CompressionResponse)
-def compress(request: CompressRequest) -> CompressionResponse:
-    video_path = Path(request.video_path)
-    compression_service.chunker.segment_length = request.segment_length
-    try:
-        entries = compression_service.compress(video_path, metadata=request.metadata)
-    except FileNotFoundError as exc:  # pragma: no cover - passthrough
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - unexpected error
-        log.exception("api.compress.failed", error=str(exc))
-        raise HTTPException(status_code=500, detail="Compression failed") from exc
-
-    serialised = _serialise_entries(entries)
-    return CompressionResponse(chunk_count=len(entries), entries=serialised)
-
-
-@app.post("/compress/upload", response_model=CompressionResponse)
-async def compress_upload(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    segment_length: float = Form(5.0),
-    metadata: str = Form("")
+def compress(
+    payload: CompressRequest,
+    db: ChunkDatabase = Depends(deps.get_chunk_database),
+    store: FaissStore = Depends(deps.get_faiss_store),
+    encoder: VideoMAEEncoder = Depends(deps.get_videomae_encoder),
 ) -> CompressionResponse:
-    if segment_length < 0.5 or segment_length > 30.0:
-        raise HTTPException(status_code=400, detail="segment_length must be between 0.5 and 30.0 seconds")
-    try:
-        metadata_dict: Dict[str, Any] = json.loads(metadata) if metadata else {}
-        if metadata_dict and not isinstance(metadata_dict, dict):
-            raise ValueError
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="metadata must be a JSON object") from exc
+    source = _validate_source(Path(payload.video_path))
+    segment_seconds = max(1, int(round(payload.segment_length)))
 
-    filename = file.filename or "upload.mp4"
-    suffix = Path(filename).suffix or ".mp4"
-    stem = Path(filename).stem or "video"
-    stored_path = compression_service.manifest.config.upload_dir / f"{stem}_{uuid.uuid4().hex}{suffix}"
+    video_id = uuid.uuid4().hex
+    output_dir = CONFIG.storage.chunk_dir / video_id
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        with stored_path.open("wb") as target:
-            shutil.copyfileobj(file.file, target)
-    finally:
-        background_tasks.add_task(file.close)
+    chunks = segment_video(str(source), str(output_dir), sec=segment_seconds)
+    if not chunks:
+        return CompressionResponse(video_id=video_id, chunk_ids=[])
 
-    compression_service.chunker.segment_length = segment_length
-    try:
-        entries = compression_service.compress(stored_path, metadata=metadata_dict)
-    except Exception as exc:
-        log.exception("api.compress_upload.failed", error=str(exc))
-        raise HTTPException(status_code=500, detail="Compression failed") from exc
+    vectors: List[np.ndarray] = []
+    chunk_ids: List[str] = []
+    records: List[ChunkRecord] = []
+    metadata = dict(payload.metadata or {})
 
-    serialised = _serialise_entries(entries)
-    return CompressionResponse(chunk_count=len(entries), entries=serialised)
+    for chunk in chunks:
+        frames = read_video_frames_rgb(chunk.path)
+        embedding = np.asarray(encoder.encode(frames), dtype=np.float32)
+        if embedding.ndim != 1:
+            raise HTTPException(status_code=500, detail="Encoder returned invalid embedding shape")
+        if embedding.shape[0] != store.dim:
+            raise HTTPException(status_code=500, detail="Embedding dimension mismatch with index")
+        vectors.append(embedding)
+
+        chunk_id = _build_chunk_id(video_id, chunk)
+        chunk_ids.append(chunk_id)
+        record = ChunkRecord(
+            id=chunk_id,
+            video_id=video_id,
+            t0=chunk.t0,
+            t1=chunk.t1,
+            path=chunk.path,
+            meta=_build_chunk_meta(chunk, metadata),
+        )
+        records.append(record)
+
+    db.insert_chunks(records)
+    matrix = np.stack(vectors, axis=0)
+    store.add(chunk_ids, matrix)
+    deps.persist_faiss_store(store)
+
+    return CompressionResponse(video_id=video_id, chunk_ids=chunk_ids)
 
 
 @app.post("/query", response_model=QueryResponse)
-def query(request: QueryRequest) -> QueryResponse:
-    results = query_service.query(request.query, top_k=request.top_k)
-    serialised = _serialise_query_results(results)
-    return QueryResponse(results=serialised)
+def query(
+    payload: QueryRequest,
+    db: ChunkDatabase = Depends(deps.get_chunk_database),
+    store: FaissStore = Depends(deps.get_faiss_store),
+    text_encoder: TextEncoder = Depends(deps.get_text_encoder),
+) -> QueryResponse:
+    if len(store) == 0:
+        return QueryResponse(count=0, hits=[])
+
+    vector = np.asarray(text_encoder.encode(payload.query), dtype=np.float32)
+    results = store.search(vector, payload.top_k)
+
+    hits: List[QueryHit] = []
+    for result in results:
+        record = db.get_chunk(result.chunk_id)
+        if record is None:
+            continue
+        hits.append(
+            QueryHit(
+                chunk_id=result.chunk_id,
+                score=result.score,
+                t0=record.t0,
+                t1=record.t1,
+                preview_uri=record.path,
+                meta=record.meta or {},
+            )
+        )
+    return QueryResponse(count=len(hits), hits=hits)
 
 
 @app.post("/decode", response_model=DecodeResponse)
-def decode(request: DecodeRequest) -> DecodeResponse:
-    try:
-        chunk_path = query_service.decode(request.chunk_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Chunk not found") from exc
-    return DecodeResponse(
-        chunk_id=request.chunk_id,
-        chunk_path=str(chunk_path),
-        chunk_url=f"/chunks/{request.chunk_id}",
-    )
+def decode(
+    payload: DecodeRequest,
+    db: ChunkDatabase = Depends(deps.get_chunk_database),
+) -> DecodeResponse:
+    record = db.get_chunk(payload.chunk_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+    return DecodeResponse(chunk_id=payload.chunk_id, uri=record.path)
 
 
-@app.get("/chunks/{chunk_id}")
-def stream_chunk(chunk_id: str):
-    try:
-        chunk_path = query_service.decode(chunk_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Chunk not found") from exc
-    if not chunk_path.exists():
-        raise HTTPException(status_code=404, detail="Chunk file missing")
-    return FileResponse(chunk_path, media_type="video/mp4", filename=chunk_path.name)
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics(
+    db: ChunkDatabase = Depends(deps.get_chunk_database),
+    store: FaissStore = Depends(deps.get_faiss_store),
+) -> dict:
+    return {
+        "chunks": db.count_chunks(),
+        "index_size": len(store),
+        "index_path": str(deps.get_index_path()),
+    }
 
 
 __all__ = ["app"]

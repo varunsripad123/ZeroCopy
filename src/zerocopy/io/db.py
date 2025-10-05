@@ -104,6 +104,14 @@ class ChunkDatabase:
         rows = cur.fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def count_chunks(self) -> int:
+        """Return the total number of stored chunks."""
+
+        cur = self._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM chunks")
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
     # -- conversion -------------------------------------------------------------
     def _row_to_record(self, row: sqlite3.Row) -> ChunkRecord:
         meta_raw = row["meta"]

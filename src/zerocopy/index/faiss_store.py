@@ -159,5 +159,8 @@ class FaissStore:
             store._vectors = np.empty((0, dim), dtype="float32")
         return store
 
+    def __len__(self) -> int:
+        return len(self._ids)
+
 
 __all__ = ["FaissStore", "SearchResult"]
